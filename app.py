@@ -8,14 +8,36 @@ import logging
 import requests
 from typing import List, Optional
 
-
+# --- Импорты и настройка Natasha ---
+from natasha import (
+    Segmenter,
+    MorphVocab,
+    NewsEmbedding,
+    NewsMorphTagger,
+    NewsSyntaxParser,
+    NewsNERTagger,
+    Doc
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# --- Глобальная инициализация моделей Natasha для производительности ---
+# Модели загружаются один раз при запуске, а не на каждый запрос.
+logging.info("Загрузка моделей Natasha...")
+segmenter = Segmenter()
+morph_vocab = MorphVocab()
+emb = NewsEmbedding()
+morph_tagger = NewsMorphTagger(emb)
+syntax_parser = NewsSyntaxParser(emb)
+ner_tagger = NewsNERTagger(emb)
+logging.info("Модели Natasha успешно загружены.")
+# --- Конец блока Natasha ---
+
+
 app = FastAPI(
     title="News Parser API",
-    description="API для парсинга новостей с Lenta.ru и RBC.ru",
-    version="1.0.0"
+    description="API для парсинга новостей с Lenta.ru и RBC.ru с функцией извлечения названий компаний.",
+    version="1.1.0" # Обновим версию
 )
 
 class Article(BaseModel):
@@ -24,6 +46,9 @@ class Article(BaseModel):
     text: Optional[str] = Field(None, description="Полный текст статьи")
     date: Optional[datetime] = Field(None, description="Дата публикации статьи")
     source: str = Field(..., description="Источник статьи (Lenta.ru или RBC.ru)")
+    # --- Новое поле для найденных компаний ---
+    found_companies: Optional[List[str]] = Field(None, description="Список компаний, найденных в тексте статьи")
+
 
 class ParserParams(BaseModel):
     date_from: date = Field(..., description="Начальная дата для парсинга (YYYY-MM-DD)")
@@ -31,30 +56,51 @@ class ParserParams(BaseModel):
     query: str = Field(..., description="Поисковой запрос (ключевое слово)")
 
 
+# --- Функция для извлечения компаний с помощью Natasha ---
+def extract_companies_ner(text: Optional[str]) -> List[str]:
+    """
+    Извлекает названия организаций из текста с помощью Natasha.
+    Возвращает пустой список, если текст отсутствует или компании не найдены.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+
+    doc = Doc(text)
+    doc.segment(segmenter)
+    doc.tag_morph(morph_tagger)
+    # doc.parse_syntax(syntax_parser) # Синтаксический парсинг не обязателен для NER
+    doc.tag_ner(ner_tagger)
+
+    # Нормализация для избежания дубликатов ("ПАО Сбербанк", "Сбербанка" -> "сбербанк")
+    found_companies = set()
+    for span in doc.spans:
+        if span.type == 'ORG':
+            span.normalize(morph_vocab)
+            found_companies.add(span.normal)
+            
+    return list(found_companies)
+
 
 # --- RBC.ru Parser --- #
 class RBCParser:
     def __init__(self):
         pass
-    \
+    
     def _get_url(self, param_dict: dict) -> str:
         url = 'https://www.rbc.ru/search/ajax/?' + \
         'project={0}&'.format(param_dict['project']) + \
-        'category={0}&'.format(param_dict['category']) + \
         'dateFrom={0}&'.format(param_dict['dateFrom']) + \
         'dateTo={0}&'.format(param_dict['dateTo']) + \
         'page={0}&'.format(param_dict['page']) + \
-        'query={0}&'.format(param_dict['query']) + \
-        'material={0}'.format(param_dict['material'])
-        \
+        'query={0}&'.format(param_dict['query'])
         return url
-    \
+    
     def _get_article_data(self, url: str):
         try:
             r = rq.get(url)
             r.raise_for_status()
             soup = bs(r.text, features="lxml")
-            \
+            
             div_overview = soup.find('div', {'class': 'article__text__overview'})
             overview = div_overview.text.replace('<br />', '\n').strip() if div_overview else None
 
@@ -69,7 +115,7 @@ class RBCParser:
             else:
                 text = None
                 logging.warning(f"Не удалось найти тело статьи на {url}")
-            \
+            
             return overview, text
         except requests.exceptions.RequestException as e:
             logging.error(f"Ошибка запроса при получении текста статьи с {url}: {e}", exc_info=True)
@@ -125,13 +171,11 @@ class RBCParser:
             return pd.DataFrame(columns=['id', 'date', 'title', 'text', 'source'])
 
     def get_articles(self,
-                     date_from: date,
-                     date_to: date,
-                     query: str) -> pd.DataFrame:
+                        date_from: date,
+                        date_to: date,
+                        query: str) -> pd.DataFrame:
         param_copy = {
-            'project': 'rbcnews',
-            'category': 'TopRbcRu_economics',
-            'material': '',
+            'project': 'quote',
             'page': '0',
             'dateFrom': date_from.strftime('%d.%m.%Y'),
             'dateTo': date_to.strftime('%d.%m.%Y'),
@@ -150,7 +194,7 @@ class RBCParser:
 class LentaRuParser:
     def __init__(self):
         pass
-    \
+    
     def _get_url(self, param_dict: dict) -> str:
         hasType = int(param_dict['type']) != 0
         hasBloc = int(param_dict['bloc']) != 0
@@ -167,7 +211,7 @@ class LentaRuParser:
         + 'modified%2Cfrom={}&'.format(param_dict['dateFrom']) \
         + 'modified%2Cto={}&'.format(param_dict['dateTo']) \
         + 'query={}'.format(param_dict['query'])
-        \
+        
         return url
 
     def _get_article_data(self, url: str) -> Optional[str]:
@@ -235,9 +279,9 @@ class LentaRuParser:
             return pd.DataFrame(columns=['id', 'date', 'title', 'text', 'source'])
 
     def get_articles(self,
-                     date_from: date,
-                     date_to: date,
-                     query: str) -> pd.DataFrame:
+                        date_from: date,
+                        date_to: date,
+                        query: str) -> pd.DataFrame:
         param_copy = {
             'query'     : query, \
             'from'      : "0", # Смещение всегда 0 для API
@@ -265,7 +309,7 @@ async def parse_news(params: ParserParams):
     lenta_parser_instance = LentaRuParser()
 
     logging.info(f"Начало парсинга: date_from={params.date_from}, date_to={params.date_to}, query={params.query}")
-    \
+    
     rbc_articles_df = rbc_parser_instance.get_articles(params.date_from, params.date_to, params.query)
     lenta_articles_df = lenta_parser_instance.get_articles(params.date_from, params.date_to, params.query)
 
@@ -274,12 +318,22 @@ async def parse_news(params: ParserParams):
     combined_df['id'] = range(1, len(combined_df) + 1)
     combined_df['id'] = combined_df['id'].astype(str)
 
+    # --- ИНТЕГРАЦИЯ NATASHA ---
+    logging.info("Начало извлечения названий компаний...")
+    # Применяем функцию к столбцу 'text', обрабатывая возможные пустые значения
+    combined_df['found_companies'] = combined_df['text'].apply(extract_companies_ner)
+    logging.info("Извлечение названий компаний завершено.")
+    # --- КОНЕЦ ИНТЕГРАЦИИ ---
+
     logging.info(f"Завершено парсинг. Всего статей: {len(combined_df)}")
     
     output_filename = f"parsed_articles_{params.date_from}_{params.date_to}_{params.query}.csv"
     try:
+        # Сохраняем в CSV с новым столбцом
         combined_df.to_csv(output_filename, index=False, encoding='utf-8')
         logging.info(f"Данные успешно сохранены в файл: {output_filename}")
     except Exception as e:
         logging.error(f"Ошибка при сохранении данных в файл {output_filename}: {e}", exc_info=True)
-    return combined_df.to_dict(orient='records') 
+        
+    # Возвращаем результат в формате, соответствующем модели Article
+    return combined_df.to_dict(orient='records')
