@@ -22,8 +22,8 @@ from natasha import (
 # --- Импорт для анализа тональности ---
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 
-from NoDuplicates import deduplicate_news_with_annoy # Импортируем функцию дедупликации
-from okved_analyzer import OKVEDAnalyzer # Импортируем анализатор ОКВЭД
+from NoDuplicates import deduplicate_news_with_annoy
+from okved_analyzer import OKVEDAnalyzer
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 

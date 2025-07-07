@@ -1,7 +1,7 @@
 import json
 import numpy as np
 from sentence_transformers import SentenceTransformer, util
-from annoy import AnnoyIndex
+import faiss
 
 def deduplicate_news_with_annoy(articles: list, threshold: float = 0.9) -> list:
     if not articles:
@@ -30,26 +30,31 @@ def deduplicate_news_with_annoy(articles: list, threshold: float = 0.9) -> list:
     dimension = embeddings.shape[1]
     print(f"Векторизация завершена. Размерность вектора: {dimension}")
 
-    print("\nШаг 2: Создание индекса Annoy и поиск дубликатов...")
-    annoy_index = AnnoyIndex(dimension, 'angular')
-    for i, vector in enumerate(embeddings):
-        annoy_index.add_item(i, vector)
-
-    annoy_index.build(10) 
-    print("Индекс Annoy построен.")
+    print("\nШаг 2: Создание индекса FAISS и поиск дубликатов...")
+    # Нормализуем векторы для cosine similarity
+    faiss.normalize_L2(embeddings)
+    
+    # Создаем индекс FAISS
+    index = faiss.IndexFlatIP(dimension)  # Inner Product для cosine similarity
+    index.add(embeddings.astype('float32'))
+    print("Индекс FAISS построен.")
 
     duplicate_indices = set()
     
     for i in range(len(articles)):
         if i in duplicate_indices:
             continue
-        neighbors_indices, neighbor_distances = annoy_index.get_nns_by_item(i, 5, include_distances=True)
-
+        
+        # Ищем 5 ближайших соседей
+        query_vector = embeddings[i:i+1].astype('float32')
+        similarities, neighbor_indices = index.search(query_vector, 5)
+        
         print(f"\nАнализ новости #{i}: '{articles[i]['title'][:50]}...'")
-        print(f"Найдено соседей: {len(neighbors_indices)}")
-        for j in range(1, len(neighbors_indices)):
-            neighbor_idx = neighbors_indices[j]
-            similarity = util.cos_sim(embeddings[i], embeddings[neighbor_idx]).item()
+        print(f"Найдено соседей: {len(neighbor_indices[0])}")
+        
+        for j in range(1, len(neighbor_indices[0])):  # Пропускаем первый элемент (сама новость)
+            neighbor_idx = neighbor_indices[0][j]
+            similarity = similarities[0][j]
             
             print(f"  Сравнение с новостью #{neighbor_idx}: '{articles[neighbor_idx]['title'][:50]}...'")
             print(f"  Схожесть: {similarity:.4f} (порог: {threshold})")
