@@ -19,10 +19,15 @@ from natasha import (
     Doc
 )
 
+# --- Импорт для анализа тональности ---
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+
+from NoDuplicates import deduplicate_news_with_annoy # Импортируем функцию дедупликации
+from okved_analyzer import OKVEDAnalyzer # Импортируем анализатор ОКВЭД
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Глобальная инициализация моделей Natasha для производительности ---
-# Модели загружаются один раз при запуске, а не на каждый запрос.
 logging.info("Загрузка моделей Natasha...")
 segmenter = Segmenter()
 morph_vocab = MorphVocab()
@@ -31,13 +36,35 @@ morph_tagger = NewsMorphTagger(emb)
 syntax_parser = NewsSyntaxParser(emb)
 ner_tagger = NewsNERTagger(emb)
 logging.info("Модели Natasha успешно загружены.")
-# --- Конец блока Natasha ---
 
+# --- Глобальная инициализация модели для анализа тональности ---
+logging.info("Загрузка модели для анализа тональности...")
+try:
+    # Используем модель для анализа тональности на русском языке
+    sentiment_pipeline = pipeline(
+        "sentiment-analysis", 
+        model="blanchefort/rubert-base-cased-sentiment-rusentiment",
+        tokenizer="blanchefort/rubert-base-cased-sentiment-rusentiment"
+    )
+    logging.info("Модель тональности успешно загружена.")
+except Exception as e:
+    logging.warning(f"Не удалось загрузить модель тональности: {e}. Будет использована заглушка.")
+    sentiment_pipeline = None
+
+# --- Инициализация анализатора ОКВЭД ---
+logging.info("Инициализация анализатора ОКВЭД...")
+try:
+    okved_analyzer = OKVEDAnalyzer()
+    logging.info("Анализатор ОКВЭД успешно инициализирован.")
+except Exception as e:
+    logging.error(f"Ошибка при инициализации анализатора ОКВЭД: {e}")
+    okved_analyzer = None
+# --- Конец блока инициализации ---
 
 app = FastAPI(
     title="News Parser API",
-    description="API для парсинга новостей с Lenta.ru и RBC.ru с функцией извлечения названий компаний.",
-    version="1.1.0" # Обновим версию
+    description="API для парсинга новостей с RBC.ru с функциями: извлечения названий компаний, анализа тональности, дедупликации и определения кодов ОКВЭД.",
+    version="2.0.0"
 )
 
 class Article(BaseModel):
@@ -46,17 +73,18 @@ class Article(BaseModel):
     text: Optional[str] = Field(None, description="Полный текст статьи")
     date: Optional[datetime] = Field(None, description="Дата публикации статьи")
     source: str = Field(..., description="Источник статьи (Lenta.ru или RBC.ru)")
-    # --- Новое поле для найденных компаний ---
     found_companies: Optional[List[str]] = Field(None, description="Список компаний, найденных в тексте статьи")
-
+    sentiment: Optional[str] = Field(None, description="Тональность новости (положительная, отрицательная, нейтральная)")
+    sentiment_score: Optional[float] = Field(None, description="Числовая оценка тональности от 0 до 1")
+    okved_codes: Optional[str] = Field(None, description="Коды ОКВЭД через запятую")
+    okved_descriptions: Optional[str] = Field(None, description="Описания кодов ОКВЭД через запятую")
+    okved_scores: Optional[str] = Field(None, description="Оценки соответствия кодов ОКВЭД через запятую")
 
 class ParserParams(BaseModel):
     date_from: date = Field(..., description="Начальная дата для парсинга (YYYY-MM-DD)")
     date_to: date = Field(..., description="Конечная дата для парсинга (YYYY-MM-DD)")
     query: str = Field(..., description="Поисковой запрос (ключевое слово)")
 
-
-# --- Функция для извлечения компаний с помощью Natasha ---
 def extract_companies_ner(text: Optional[str]) -> List[str]:
     """
     Извлекает названия организаций из текста с помощью Natasha.
@@ -68,10 +96,8 @@ def extract_companies_ner(text: Optional[str]) -> List[str]:
     doc = Doc(text)
     doc.segment(segmenter)
     doc.tag_morph(morph_tagger)
-    # doc.parse_syntax(syntax_parser) # Синтаксический парсинг не обязателен для NER
     doc.tag_ner(ner_tagger)
 
-    # Нормализация для избежания дубликатов ("ПАО Сбербанк", "Сбербанка" -> "сбербанк")
     found_companies = set()
     for span in doc.spans:
         if span.type == 'ORG':
@@ -80,6 +106,69 @@ def extract_companies_ner(text: Optional[str]) -> List[str]:
             
     return list(found_companies)
 
+def analyze_sentiment_for_companies(text: Optional[str], companies: List[str]) -> tuple[str, float]:
+    """
+    Анализирует тональность текста с фокусом на упоминания компаний и экономические показатели.
+    """
+    if not isinstance(text, str) or not text.strip() or not companies:
+        return "нейтральная", 0.5
+    
+    if sentiment_pipeline is None:
+        return "нейтральная", 0.5
+    
+    try:
+        # Экономические индикаторы
+        positive_indicators = ['рост', 'увеличение', 'прибыль', 'успех', 'развитие', 'расширение', 
+                             'инвестиции', 'сделка', 'контракт', 'партнерство']
+        negative_indicators = ['падение', 'снижение', 'убыток', 'банкротство', 'сокращение', 
+                             'закрытие', 'штраф', 'санкции', 'проблемы', 'риски']
+        
+        # Разбиваем текст на предложения с упоминанием компаний
+        relevant_sentences = []
+        sentences = text.split('.')
+        for sentence in sentences:
+            if any(company.lower() in sentence.lower() for company in companies):
+                relevant_sentences.append(sentence)
+        
+        if not relevant_sentences:
+            return "нейтральная", 0.5
+            
+        # Анализируем каждое релевантное предложение
+        sentiments = []
+        for sentence in relevant_sentences:
+            # Проверяем наличие экономических индикаторов
+            pos_count = sum(1 for indicator in positive_indicators if indicator in sentence.lower())
+            neg_count = sum(1 for indicator in negative_indicators if indicator in sentence.lower())
+            
+            # Получаем базовую тональность от модели
+            result = sentiment_pipeline(sentence[:512])[0]
+            base_score = result['score']
+            
+            # Корректируем оценку с учетом экономических индикаторов
+            adjusted_score = base_score
+            if pos_count > neg_count:
+                adjusted_score = min(1.0, base_score + 0.2)
+            elif neg_count > pos_count:
+                adjusted_score = max(0.0, base_score - 0.2)
+                
+            sentiments.append(adjusted_score)
+        
+        # Вычисляем среднюю оценку
+        final_score = sum(sentiments) / len(sentiments)
+        
+        # Определяем итоговую тональность
+        if final_score >= 0.6:
+            sentiment = "положительная"
+        elif final_score <= 0.4:
+            sentiment = "отрицательная"
+        else:
+            sentiment = "нейтральная"
+            
+        return sentiment, final_score
+        
+    except Exception as e:
+        logging.error(f"Ошибка при анализе тональности: {e}")
+        return "нейтральная", 0.5
 
 # --- RBC.ru Parser --- #
 class RBCParser:
@@ -190,150 +279,77 @@ class RBCParser:
         return articles_df
 
 
-# --- Lenta.ru Parser --- #
-class LentaRuParser:
-    def __init__(self):
-        pass
-    
-    def _get_url(self, param_dict: dict) -> str:
-        hasType = int(param_dict['type']) != 0
-        hasBloc = int(param_dict['bloc']) != 0
-
-        url = 'https://lenta.ru/search/v2/process?' \
-        + 'from={}&'.format(param_dict['from']) \
-        + 'size={}&'.format(param_dict['size']) \
-        + 'sort={}&'.format(param_dict['sort']) \
-        + 'title_only={}&'.format(param_dict['title_only']) \
-        + 'domain={}&'.format(param_dict['domain']) \
-        + 'modified%2Cformat=yyyy-MM-dd&' \
-        + 'type={}&'.format(param_dict['type']) * hasType \
-        + 'bloc={}&'.format(param_dict['bloc']) * hasBloc \
-        + 'modified%2Cfrom={}&'.format(param_dict['dateFrom']) \
-        + 'modified%2Cto={}&'.format(param_dict['dateTo']) \
-        + 'query={}'.format(param_dict['query'])
-        
-        return url
-
-    def _get_article_data(self, url: str) -> Optional[str]:
-        try:
-            r = rq.get(url)
-            r.raise_for_status()
-            soup = bs(r.text, features="lxml")
-            article_body = soup.find('div', class_='topic-body')
-            if article_body:
-                text_parts = []
-                for p_tag in article_body.find_all('p'):
-                    text_parts.append(p_tag.get_text())
-                text = '\n'.join(text_parts).strip()
-                logging.debug(f"Текст статьи успешно получен с {url}")
-                return text
-            else:
-                logging.warning(f"Не удалось найти тело статьи на {url}")
-                return None
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Ошибка запроса при получении текста статьи с {url}: {e}", exc_info=True)
-            return None
-        except Exception as e:
-            logging.error(f"Неизвестная ошибка при получении текста статьи с {url}: {e}", exc_info=True)
-            return None
-
-    def _get_search_table(self, param_dict: dict) -> pd.DataFrame:
-        url = self._get_url(param_dict)
-        logging.info(f"Запрос таблицы поиска для Lenta.ru: {url}")
-        try:
-            r = rq.get(url)
-            r.raise_for_status()
-            search_results = r.json().get('matches', [])
-            logging.info(f"Получено {len(search_results)} результатов поиска от Lenta.ru.")
-            
-            articles_data = []
-            for article in search_results:
-                article_id = str(article.get('url'))
-                date_str = article.get('modified')
-                date_obj = None
-                if isinstance(date_str, str):
-                    try:
-                        date_obj = datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S.%fZ')
-                    except ValueError:
-                        logging.warning(f"Не удалось распарсить строковую дату '{date_str}' для статьи: {article.get('url')}")
-                elif isinstance(date_str, (int, float)):
-                    try:
-                        date_obj = datetime.fromtimestamp(int(date_str))
-                    except (ValueError, TypeError):
-                        logging.warning(f"Не удалось распарсить временную метку '{date_str}' для статьи: {article.get('url')}")
-                else:
-                    logging.warning(f"Неожиданный тип даты '{type(date_str)}' для статьи: {article.get('url')}")
-                title = article.get('title')
-                article_url = article.get('url')
-                
-                text = self._get_article_data(article_url) if article_url else None
-                
-                articles_data.append({'id': article_id, 'date': date_obj, 'title': title, 'text': text, 'source': 'Lenta.ru'})
-                
-            return pd.DataFrame(articles_data)
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Ошибка запроса при получении таблицы поиска с {url}: {e}", exc_info=True)
-            return pd.DataFrame(columns=['id', 'date', 'title', 'text', 'source'])
-        except Exception as e:
-            logging.error(f"Неизвестная ошибка при получении таблицы поиска с {url}: {e}", exc_info=True)
-            return pd.DataFrame(columns=['id', 'date', 'title', 'text', 'source'])
-
-    def get_articles(self,
-                        date_from: date,
-                        date_to: date,
-                        query: str) -> pd.DataFrame:
-        param_copy = {
-            'query'     : query, \
-            'from'      : "0", # Смещение всегда 0 для API
-            'size'      : "1000", # Максимальный размер, чтобы получить все за раз
-            'dateFrom'  : date_from.strftime('%Y-%m-%d'),
-            'dateTo'    : date_to.strftime('%Y-%m-%d'),
-            'sort'      : "3", # Сортировка по дате, но Lenta.ru API может иметь свои нюансы
-            'title_only': "0",
-            'type'      : "0", # Все материалы
-            'bloc'      : "0", # Все рубрики
-            'domain'    : "1"
-        }
-        
-        logging.info(f"Начало парсинга для Lenta.ru с date_from={date_from} по date_to={date_to}, query={query}")
-        articles_df = self._get_search_table(param_copy)
-            
-        logging.info('Парсинг Lenta.ru завершен.')
-        
-        return articles_df
-
 
 @app.post("/parse", response_model=List[Article])
 async def parse_news(params: ParserParams):
     rbc_parser_instance = RBCParser()
-    lenta_parser_instance = LentaRuParser()
 
     logging.info(f"Начало парсинга: date_from={params.date_from}, date_to={params.date_to}, query={params.query}")
     
     rbc_articles_df = rbc_parser_instance.get_articles(params.date_from, params.date_to, params.query)
-    lenta_articles_df = lenta_parser_instance.get_articles(params.date_from, params.date_to, params.query)
-
-    combined_df = pd.concat([rbc_articles_df, lenta_articles_df], axis=0, ignore_index=True)
-    combined_df.drop_duplicates(subset=['title', 'source'], inplace=True)
-    combined_df['id'] = range(1, len(combined_df) + 1)
-    combined_df['id'] = combined_df['id'].astype(str)
-
-    # --- ИНТЕГРАЦИЯ NATASHA ---
-    logging.info("Начало извлечения названий компаний...")
-    # Применяем функцию к столбцу 'text', обрабатывая возможные пустые значения
-    combined_df['found_companies'] = combined_df['text'].apply(extract_companies_ner)
-    logging.info("Извлечение названий компаний завершено.")
-    # --- КОНЕЦ ИНТЕГРАЦИИ ---
-
-    logging.info(f"Завершено парсинг. Всего статей: {len(combined_df)}")
+    combined_df = rbc_articles_df.copy() 
     
-    output_filename = f"parsed_articles_{params.date_from}_{params.date_to}_{params.query}.csv"
-    try:
-        # Сохраняем в CSV с новым столбцом
-        combined_df.to_csv(output_filename, index=False, encoding='utf-8')
-        logging.info(f"Данные успешно сохранены в файл: {output_filename}")
-    except Exception as e:
-        logging.error(f"Ошибка при сохранении данных в файл {output_filename}: {e}", exc_info=True)
+    logging.info("Начало дедупликации новостей...")
+    articles_list_for_dedup = combined_df.to_dict(orient='records')
+    cleaned_articles_list = deduplicate_news_with_annoy(articles_list_for_dedup)
+    combined_df = pd.DataFrame(cleaned_articles_list)
+    logging.info(f"Дедупликация завершена. Осталось статей после дедупликации: {len(combined_df)}")
+
+    if len(combined_df) >= 1:
+        combined_df['id'] = range(1, len(combined_df) + 1)
+        combined_df['id'] = combined_df['id'].astype(str)
         
-    # Возвращаем результат в формате, соответствующем модели Article
-    return combined_df.to_dict(orient='records')
+        # Извлечение компаний
+        logging.info("Начало извлечения названий компаний...")
+        combined_df['found_companies'] = combined_df['text'].apply(extract_companies_ner)
+        logging.info("Извлечение названий компаний завершено.")
+        
+        # Анализ тональности с учетом найденных компаний
+        logging.info("Начало анализа тональности...")
+        sentiment_results = combined_df.apply(
+            lambda row: analyze_sentiment_for_companies(row['text'], row['found_companies']), 
+            axis=1
+        )
+        combined_df['sentiment'] = sentiment_results.apply(lambda x: x[0])
+        combined_df['sentiment_score'] = sentiment_results.apply(lambda x: x[1])
+        logging.info("Анализ тональности завершен.")
+        
+        # Анализ ОКВЭД
+        if okved_analyzer is not None:
+            logging.info("Начало анализа ОКВЭД...")
+            # Получаем коды ОКВЭД
+            okved_results = combined_df.apply(
+                lambda row: okved_analyzer.find_relevant_okved_codes(
+                    row['text'], 
+                    row['title'],
+                    top_k=10
+                ), 
+                axis=1
+            )
+            # Преобразуем результаты в строки
+            combined_df['okved_codes'] = okved_results.apply(
+                lambda codes: ', '.join([code['okved_code'] for code in codes]) if codes else ''
+            )
+            combined_df['okved_descriptions'] = okved_results.apply(
+                lambda codes: ', '.join([code['okved_description'] for code in codes]) if codes else ''
+            )
+            combined_df['okved_scores'] = okved_results.apply(
+                lambda codes: ', '.join([str(code['similarity_score']) for code in codes]) if codes else ''
+            )
+            logging.info("Анализ ОКВЭД завершен.")
+        else:
+            combined_df['okved_codes'] = ''
+            combined_df['okved_descriptions'] = ''
+            combined_df['okved_scores'] = ''
+
+        logging.info(f"Обработка завершена. Всего статей: {len(combined_df)}")
+        
+        output_filename = f"parsed_articles_{params.date_from}_{params.date_to}_{params.query}.csv"
+        try:
+            combined_df.to_csv(output_filename, index=False, encoding='utf-8')
+            logging.info(f"Данные успешно сохранены в файл: {output_filename}")
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении данных в файл {output_filename}: {e}", exc_info=True)
+        
+        return combined_df.to_dict(orient='records')
+    return []

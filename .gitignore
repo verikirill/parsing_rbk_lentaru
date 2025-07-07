@@ -205,3 +205,5 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# Включаем файл с кодами ОКВЭД (okved_codes.csv) в отслеживание git
+!okved_codes.csv
