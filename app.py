@@ -20,7 +20,7 @@ from natasha import (
 )
 
 # --- Импорт для анализа тональности ---
-from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
+# from transformers import AutoTokenizer, AutoModelForSequenceClassification, pipeline
 
 from NoDuplicates import deduplicate_news_with_annoy
 from okved_analyzer import OKVEDAnalyzer
@@ -38,18 +38,18 @@ ner_tagger = NewsNERTagger(emb)
 logging.info("Модели Natasha успешно загружены.")
 
 # --- Глобальная инициализация модели для анализа тональности ---
-logging.info("Загрузка модели для анализа тональности...")
-try:
-    # Используем модель для анализа тональности на русском языке
-    sentiment_pipeline = pipeline(
-        "sentiment-analysis", 
-        model="blanchefort/rubert-base-cased-sentiment-rusentiment",
-        tokenizer="blanchefort/rubert-base-cased-sentiment-rusentiment"
-    )
-    logging.info("Модель тональности успешно загружена.")
-except Exception as e:
-    logging.warning(f"Не удалось загрузить модель тональности: {e}. Будет использована заглушка.")
-    sentiment_pipeline = None
+# logging.info("Загрузка модели для анализа тональности...")
+# try:
+#     # Используем модель для анализа тональности на русском языке
+#     sentiment_pipeline = pipeline(
+#         "sentiment-analysis", 
+#         model="blanchefort/rubert-base-cased-sentiment-rusentiment",
+#         tokenizer="blanchefort/rubert-base-cased-sentiment-rusentiment"
+#     )
+#     logging.info("Модель тональности успешно загружена.")
+# except Exception as e:
+#     logging.warning(f"Не удалось загрузить модель тональности: {e}. Будет использована заглушка.")
+#     sentiment_pipeline = None
 
 # --- Инициализация анализатора ОКВЭД ---
 logging.info("Инициализация анализатора ОКВЭД...")
@@ -63,7 +63,7 @@ except Exception as e:
 
 app = FastAPI(
     title="News Parser API",
-    description="API для парсинга новостей с RBC.ru с функциями: извлечения названий компаний, анализа тональности, дедупликации и определения кодов ОКВЭД.",
+    description="API для парсинга новостей с RBC.ru с функциями: извлечения названий компаний, дедупликации и определения кодов ОКВЭД.",
     version="2.0.0"
 )
 
@@ -73,9 +73,8 @@ class Article(BaseModel):
     text: Optional[str] = Field(None, description="Полный текст статьи")
     date: Optional[datetime] = Field(None, description="Дата публикации статьи")
     source: str = Field(..., description="Источник статьи (Lenta.ru или RBC.ru)")
+    url: Optional[str] = Field(None, description="Ссылка на оригинальную статью")
     found_companies: Optional[List[str]] = Field(None, description="Список компаний, найденных в тексте статьи")
-    sentiment: Optional[str] = Field(None, description="Тональность новости (положительная, отрицательная, нейтральная)")
-    sentiment_score: Optional[float] = Field(None, description="Числовая оценка тональности от 0 до 1")
     okved_codes: Optional[str] = Field(None, description="Коды ОКВЭД через запятую")
     okved_descriptions: Optional[str] = Field(None, description="Описания кодов ОКВЭД через запятую")
     okved_scores: Optional[str] = Field(None, description="Оценки соответствия кодов ОКВЭД через запятую")
@@ -106,69 +105,7 @@ def extract_companies_ner(text: Optional[str]) -> List[str]:
             
     return list(found_companies)
 
-def analyze_sentiment_for_companies(text: Optional[str], companies: List[str]) -> tuple[str, float]:
-    """
-    Анализирует тональность текста с фокусом на упоминания компаний и экономические показатели.
-    """
-    if not isinstance(text, str) or not text.strip() or not companies:
-        return "нейтральная", 0.5
-    
-    if sentiment_pipeline is None:
-        return "нейтральная", 0.5
-    
-    try:
-        # Экономические индикаторы
-        positive_indicators = ['рост', 'увеличение', 'прибыль', 'успех', 'развитие', 'расширение', 
-                             'инвестиции', 'сделка', 'контракт', 'партнерство']
-        negative_indicators = ['падение', 'снижение', 'убыток', 'банкротство', 'сокращение', 
-                             'закрытие', 'штраф', 'санкции', 'проблемы', 'риски']
-        
-        # Разбиваем текст на предложения с упоминанием компаний
-        relevant_sentences = []
-        sentences = text.split('.')
-        for sentence in sentences:
-            if any(company.lower() in sentence.lower() for company in companies):
-                relevant_sentences.append(sentence)
-        
-        if not relevant_sentences:
-            return "нейтральная", 0.5
-            
-        # Анализируем каждое релевантное предложение
-        sentiments = []
-        for sentence in relevant_sentences:
-            # Проверяем наличие экономических индикаторов
-            pos_count = sum(1 for indicator in positive_indicators if indicator in sentence.lower())
-            neg_count = sum(1 for indicator in negative_indicators if indicator in sentence.lower())
-            
-            # Получаем базовую тональность от модели
-            result = sentiment_pipeline(sentence[:512])[0]
-            base_score = result['score']
-            
-            # Корректируем оценку с учетом экономических индикаторов
-            adjusted_score = base_score
-            if pos_count > neg_count:
-                adjusted_score = min(1.0, base_score + 0.2)
-            elif neg_count > pos_count:
-                adjusted_score = max(0.0, base_score - 0.2)
-                
-            sentiments.append(adjusted_score)
-        
-        # Вычисляем среднюю оценку
-        final_score = sum(sentiments) / len(sentiments)
-        
-        # Определяем итоговую тональность
-        if final_score >= 0.6:
-            sentiment = "положительная"
-        elif final_score <= 0.4:
-            sentiment = "отрицательная"
-        else:
-            sentiment = "нейтральная"
-            
-        return sentiment, final_score
-        
-    except Exception as e:
-        logging.error(f"Ошибка при анализе тональности: {e}")
-        return "нейтральная", 0.5
+
 
 # --- RBC.ru Parser --- #
 class RBCParser:
@@ -249,7 +186,14 @@ class RBCParser:
                 
                 overview, text = self._get_article_data(article_url) if article_url else (None, None)
                 
-                articles_data.append({'id': article_id, 'date': date_obj, 'title': title, 'text': text, 'source': 'RBC.ru'})
+                articles_data.append({
+                    'id': article_id, 
+                    'date': date_obj, 
+                    'title': title, 
+                    'text': text, 
+                    'url': article_url,
+                    'source': 'RBC.ru'
+                })
                 
             return pd.DataFrame(articles_data)
         except requests.exceptions.RequestException as e:
@@ -303,16 +247,6 @@ async def parse_news(params: ParserParams):
         logging.info("Начало извлечения названий компаний...")
         combined_df['found_companies'] = combined_df['text'].apply(extract_companies_ner)
         logging.info("Извлечение названий компаний завершено.")
-        
-        # Анализ тональности с учетом найденных компаний
-        logging.info("Начало анализа тональности...")
-        sentiment_results = combined_df.apply(
-            lambda row: analyze_sentiment_for_companies(row['text'], row['found_companies']), 
-            axis=1
-        )
-        combined_df['sentiment'] = sentiment_results.apply(lambda x: x[0])
-        combined_df['sentiment_score'] = sentiment_results.apply(lambda x: x[1])
-        logging.info("Анализ тональности завершен.")
         
         # Анализ ОКВЭД
         if okved_analyzer is not None:
