@@ -345,11 +345,11 @@ async def parse_news(params: ParserParams):
         logging.info(f"Обработка завершена. Всего статей: {len(combined_df)}")
         
         output_filename = f"parsed_articles_{params.date_from}_{params.date_to}_{params.query}.csv"
-        try:
-            combined_df.to_csv(output_filename, index=False, encoding='utf-8')
-            logging.info(f"Данные успешно сохранены в файл: {output_filename}")
-        except Exception as e:
-            logging.error(f"Ошибка при сохранении данных в файл {output_filename}: {e}", exc_info=True)
+        # try:
+            # combined_df.to_csv(output_filename, index=False, encoding='utf-8')
+            # logging.info(f"Данные успешно сохранены в файл: {output_filename}")
+        # except Exception as e:
+            # logging.error(f"Ошибка при сохранении данных в файл {output_filename}: {e}", exc_info=True)
         
         return combined_df.to_dict(orient='records')
     return []

@@ -9,10 +9,11 @@ services:
       - "8000:8000"
     volumes:
       - ./:/app
-      - model_cache:/root/.cache
+      - model_cache:/home/appuser/.cache
     environment:
       - PYTHONUNBUFFERED=1
-      - TRANSFORMERS_CACHE=/root/.cache/transformers
+      - TRANSFORMERS_CACHE=/home/appuser/.cache/transformers
+      - HF_HOME=/home/appuser/.cache/huggingface
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
